@@ -1,4 +1,4 @@
-﻿"""
+"""
 app_streamlit.py — AutoApply-AI Streamlit Dashboard
 =====================================================
 Browser-based interface sharing the same core engine and SQLite database.
@@ -90,6 +90,8 @@ if "app_id" not in st.session_state:
     st.session_state.app_id = None
 if "pitch_text" not in st.session_state:
     st.session_state.pitch_text = ""
+if "notes_text" not in st.session_state:
+    st.session_state.notes_text = ""
 if "send_status" not in st.session_state:
     st.session_state.send_status = None
 
@@ -135,15 +137,17 @@ with input_col:
         if not job_text_input.strip() or len(job_text_input.strip()) < 30:
             st.error("Please paste a meaningful job description (at least a few sentences).")
         else:
-            with st.spinner("Analysing with Gemini 2.5 Flash…"):
+            with st.status("Analysing job posting...", expanded=True) as status:
+                st.write("🤖 Contacting Gemini AI (trying model chain if needed)...")
                 try:
                     analysis = core.analyze_job(job_text_input)
                     company = analysis.get("company", "Unknown")
                     title = analysis.get("job_title", "Unknown")
+                    status.update(label="✅ Analysis complete!", state="complete", expanded=False)
 
                     if core.is_duplicate(company, title):
                         st.warning(
-                            f"?? **Duplicate detected!** You already have an application for "
+                            f"⚠️ **Duplicate detected!** You already have an application for "
                             f"**{title}** at **{company}**. Check the history ledger below."
                         )
                     else:
@@ -160,9 +164,13 @@ with input_col:
                         st.session_state.app_id = app_id
                         st.session_state.pitch_text = analysis.get("pitch", "")
                         st.session_state.send_status = None
-                        st.success("? Analysis complete! Review the results on the right.")
                 except Exception as exc:
-                    st.error(f"? Analysis failed: {exc}")
+                    status.update(label="❌ Analysis failed", state="error", expanded=True)
+                    err = str(exc)
+                    if "unavailable" in err.lower() or "503" in err:
+                        st.error("⚠️ All Gemini models are currently overloaded. Please wait 1–2 minutes and try again.")
+                    else:
+                        st.error(err)
 
     # -- Analysis trigger — Image ----------------------------------------
     if analyze_image_btn:
@@ -174,22 +182,25 @@ with input_col:
                 tmp.write(uploaded_file.getvalue())
                 tmp_path = tmp.name
 
-            with st.spinner("Extracting text from image via Gemini vision…"):
+            with st.status("Processing image...", expanded=True) as status:
                 try:
+                    st.write("📸 Running OCR via Gemini vision...")
                     extracted_text = core.extract_text_from_image(tmp_path)
                     Path(tmp_path).unlink(missing_ok=True)
 
                     if not extracted_text.strip():
+                        status.update(label="❌ No text found", state="error")
                         st.error("Could not extract meaningful text from the image.")
                     else:
-                        st.info(f"?? OCR extracted {len(extracted_text)} characters. Running analysis…")
+                        st.write(f"✅ OCR complete ({len(extracted_text)} chars). Analysing job...")
                         analysis = core.analyze_job(extracted_text)
                         company = analysis.get("company", "Unknown")
                         title = analysis.get("job_title", "Unknown")
+                        status.update(label="✅ Analysis complete!", state="complete", expanded=False)
 
                         if core.is_duplicate(company, title):
                             st.warning(
-                                f"?? **Duplicate!** Already applied to **{title}** @ **{company}**."
+                                f"⚠️ **Duplicate!** Already applied to **{title}** @ **{company}**."
                             )
                         else:
                             app_id = core.log_application(
@@ -205,10 +216,14 @@ with input_col:
                             st.session_state.app_id = app_id
                             st.session_state.pitch_text = analysis.get("pitch", "")
                             st.session_state.send_status = None
-                            st.success("? Analysis complete!")
                 except Exception as exc:
                     Path(tmp_path).unlink(missing_ok=True)
-                    st.error(f"? Image processing failed: {exc}")
+                    status.update(label="❌ Failed", state="error", expanded=True)
+                    err = str(exc)
+                    if "unavailable" in err.lower() or "503" in err:
+                        st.error("⚠️ All Gemini models are currently overloaded. Please wait 1–2 minutes and try again.")
+                    else:
+                        st.error(err)
 
 
 # -- Right: Analysis Result & Pitch Editor ----------------------------------
@@ -283,6 +298,22 @@ with result_col:
 
         st.divider()
 
+        # Notes / Suggestions chat box
+        st.markdown("**\U0001f4ac Personal Notes & Mentions** *(appended to the email)*")
+        st.caption("Add anything extra — referrals, availability, portfolio links, salary expectations, etc.")
+        edited_notes = st.text_area(
+            label="Notes",
+            value=st.session_state.notes_text,
+            height=120,
+            label_visibility="collapsed",
+            key="notes_editor",
+            placeholder="e.g. I was referred by Jane Smith  |  Available to start immediately  |  Portfolio: mysite.com",
+        )
+        if edited_notes != st.session_state.notes_text:
+            st.session_state.notes_text = edited_notes
+
+        st.divider()
+
         # HR Email override
         hr_email = analysis.get("hr_email", "")
         recipient_email = st.text_input(
@@ -299,17 +330,19 @@ with result_col:
                 if not recipient_email or "@" not in recipient_email:
                     st.error("Please provide a valid recipient email address.")
                 else:
-                    with st.spinner("Dispatching email…"):
+                    with st.spinner("Dispatching email..."):
                         success = core.send_application(
                             to_email=recipient_email,
                             job_title=analysis["job_title"],
                             company=analysis["company"],
                             pitch=st.session_state.pitch_text,
+                            notes=st.session_state.notes_text,
                         )
                     if success:
                         core.update_application_status(st.session_state.app_id, "sent")
                         st.session_state.send_status = ("success", recipient_email)
                         st.session_state.analysis = None
+                        st.session_state.notes_text = ""
                         st.rerun()
                     else:
                         st.error("? Failed to send email. Check SMTP settings in .env.")
@@ -320,6 +353,7 @@ with result_col:
                 st.session_state.analysis = None
                 st.session_state.app_id = None
                 st.session_state.pitch_text = ""
+                st.session_state.notes_text = ""
                 st.rerun()
 
     # Show success banner after send

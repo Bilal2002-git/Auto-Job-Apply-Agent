@@ -1,4 +1,4 @@
-﻿"""
+"""
 core.py — AutoApply-AI Shared Engine
 =====================================
 Central module shared by both Telegram and Streamlit frontends.
@@ -51,10 +51,27 @@ SMTP_PORT: int = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER: str = os.getenv("SMTP_USER", "")
 SMTP_PASS: str = os.getenv("SMTP_PASS", "")
 SENDER_NAME: str = os.getenv("SENDER_NAME", "Applicant")
-CV_PDF_PATH: str = os.getenv("CV_PDF_PATH", "./my_cv.pdf")
-DB_PATH: str = os.getenv("DB_PATH", "./jobs.db")
+# Resolve paths relative to this file's directory so they work regardless
+# of which directory the app (Streamlit / Telegram) is launched from.
+_BASE_DIR = Path(__file__).parent.resolve()
 
-GEMINI_MODEL: str = "gemini-2.5-flash"
+_cv_raw = os.getenv("CV_PDF_PATH", "./my_cv.pdf")
+CV_PDF_PATH: str = str((_BASE_DIR / _cv_raw).resolve()) if not Path(_cv_raw).is_absolute() else _cv_raw
+
+_db_raw = os.getenv("DB_PATH", "./jobs.db")
+DB_PATH: str = str((_BASE_DIR / _db_raw).resolve()) if not Path(_db_raw).is_absolute() else _db_raw
+
+GEMINI_MODEL: str = "gemini-3.8-flash"
+GEMINI_FALLBACK_MODEL: str = "gemini-2.5-flash-lite"  # fallback if primary is overloaded
+
+# Ordered model chain — tried in sequence on 503/429/500 errors.
+# Starts with best quality, falls back to lighter models.
+GEMINI_MODEL_CHAIN: list[str] = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
+]
 
 # ---------------------------------------------------------------------------
 # Gemini client (lazy-initialised)
@@ -292,26 +309,42 @@ def analyze_job(
 
     logger.info("Sending job analysis request to Gemini (%d chars)...", len(user_message))
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=JOB_ANALYSIS_SCHEMA,
-            temperature=0.4,
-        ),
-    )
+    import time
 
-    raw_json = response.text
-    result = json.loads(raw_json)
-    logger.info(
-        "Analysis complete — company=%s title=%s fit=%s%%",
-        result.get("company"),
-        result.get("job_title"),
-        result.get("fit_score"),
+    _TRANSIENT = ("503", "429", "500", "UNAVAILABLE", "RESOURCE_EXHAUSTED")
+    last_exc: Exception | None = None
+
+    for model in GEMINI_MODEL_CHAIN:
+        try:
+            logger.info("Trying model: %s", model)
+            response = client.models.generate_content(
+                model=model,
+                contents=user_message,
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema=JOB_ANALYSIS_SCHEMA,
+                    temperature=0.4,
+                ),
+            )
+            result = json.loads(response.text)
+            logger.info(
+                "Analysis complete (model=%s) — company=%s title=%s fit=%s%%",
+                model, result.get("company"), result.get("job_title"), result.get("fit_score"),
+            )
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if any(code in str(exc) for code in _TRANSIENT):
+                logger.warning("Model %s unavailable (%s) — trying next model in 3s...", model, exc)
+                time.sleep(3)
+            else:
+                raise  # non-transient error (auth, schema, etc.) — fail immediately
+
+    raise RuntimeError(
+        f"All Gemini models in the chain are unavailable. Last error: {last_exc}\n"
+        "Please try again in a few minutes."
     )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -350,15 +383,35 @@ def extract_text_from_image(image_path: str) -> str:
 
     logger.info("Extracting text from image %s (%d bytes)...", path.name, len(image_bytes))
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            "Extract all the text content from this job posting image. "
-            "Return only the raw extracted text, preserving structure where possible.",
-        ],
-    )
-    extracted = response.text.strip()
+    max_retries = 4
+    base_delay = 5
+    last_exc = None
+    extracted = ""
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    "Extract all the text content from this job posting image. "
+                    "Return only the raw extracted text, preserving structure where possible.",
+                ],
+            )
+            extracted = response.text.strip()
+            break
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc)
+            if any(code in err_str for code in ("503", "429", "500", "UNAVAILABLE", "RESOURCE_EXHAUSTED")):
+                import time
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning("Gemini OCR transient error (attempt %d/%d): %s — retrying in %ds...", attempt, max_retries, exc, delay)
+                time.sleep(delay)
+            else:
+                raise
+    else:
+        raise last_exc
     logger.info("Image OCR complete — extracted %d chars.", len(extracted))
     return extracted
 
@@ -366,10 +419,20 @@ def extract_text_from_image(image_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Email Dispatch
 # ---------------------------------------------------------------------------
-def build_email_html(pitch: str, job_title: str, company: str, sender_name: str) -> str:
-    """Build a clean HTML email body from the pitch text."""
+def build_email_html(pitch: str, job_title: str, company: str, sender_name: str, notes: str = "") -> str:
+    """Build a clean HTML email body from the pitch text and optional personal notes."""
     paragraphs = pitch.split("\n\n") if "\n\n" in pitch else pitch.split("\n")
     para_html = "".join(f"<p>{p.strip()}</p>" for p in paragraphs if p.strip())
+
+    notes_html = ""
+    if notes and notes.strip():
+        notes_lines = "".join(f"<p>{line.strip()}</p>" for line in notes.strip().split("\n") if line.strip())
+        notes_html = f"""
+  <div style="margin-top:24px;padding:16px;background:#f8f9ff;border-left:4px solid #4a6cf7;border-radius:4px;">
+    <p style="margin:0 0 8px 0;font-weight:600;color:#4a6cf7;">Additional Notes</p>
+    {notes_lines}
+  </div>"""
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -382,6 +445,7 @@ def build_email_html(pitch: str, job_title: str, company: str, sender_name: str)
 </head>
 <body>
   {para_html}
+  {notes_html}
   <div class="footer">
     This email was prepared by AutoApply-AI for <strong>{sender_name}</strong>.<br>
     Application for: <em>{job_title}</em> @ <em>{company}</em>
@@ -395,6 +459,7 @@ def send_application(
     job_title: str,
     company: str,
     pitch: str,
+    notes: str = "",
     cv_path: str = CV_PDF_PATH,
     smtp_host: str = SMTP_HOST,
     smtp_port: int = SMTP_PORT,
@@ -410,6 +475,7 @@ def send_application(
         job_title:   Job role title (used in subject line).
         company:     Company name (used in subject line).
         pitch:       3-paragraph pitch text (converted to HTML body).
+        notes:       Optional extra personal notes / mentions appended to the email.
         cv_path:     Path to the candidate CV PDF to attach.
         smtp_*:      SMTP server credentials (defaults to env vars).
         sender_name: Display name for the From header.
@@ -422,8 +488,13 @@ def send_application(
             "SMTP configuration is incomplete. Set SMTP_HOST, SMTP_USER, SMTP_PASS in .env."
         )
 
-    subject = f"Application: {job_title} — {sender_name}"
-    html_body = build_email_html(pitch, job_title, company, sender_name)
+    subject = f"Application: {job_title} | {sender_name}"
+    html_body = build_email_html(pitch, job_title, company, sender_name, notes)
+
+    # Plain-text fallback: pitch + notes
+    plain_body = pitch
+    if notes and notes.strip():
+        plain_body += f"\n\n---\nAdditional Notes:\n{notes.strip()}"
 
     msg = MIMEMultipart("mixed")
     msg["From"] = f"{sender_name} <{smtp_user}>"
@@ -432,11 +503,16 @@ def send_application(
     msg["Date"] = datetime.now().strftime("%a, %d %b %Y %H:%M:%S +0000")
 
     alt_part = MIMEMultipart("alternative")
-    alt_part.attach(MIMEText(pitch, "plain", "utf-8"))
+    alt_part.attach(MIMEText(plain_body, "plain", "utf-8"))
     alt_part.attach(MIMEText(html_body, "html", "utf-8"))
     msg.attach(alt_part)
 
+    # ── CV Attachment ──────────────────────────────────────────────────────
     cv_file = Path(cv_path)
+    # If still relative, resolve against this module's directory
+    if not cv_file.is_absolute():
+        cv_file = (_BASE_DIR / cv_path).resolve()
+
     if cv_file.exists():
         with open(cv_file, "rb") as f:
             pdf_bytes = f.read()
@@ -449,7 +525,11 @@ def send_application(
         msg.attach(cv_attachment)
         logger.info("CV attached: %s (%d bytes)", cv_file.name, len(pdf_bytes))
     else:
-        logger.warning("CV file not found at %s — sending without attachment.", cv_path)
+        logger.warning(
+            "CV file not found at '%s' — sending without attachment. "
+            "Check CV_PDF_PATH in your .env file.",
+            cv_file,
+        )
 
     try:
         logger.info("Connecting to SMTP %s:%s...", smtp_host, smtp_port)
