@@ -1,0 +1,23 @@
+# AutoApply-AI — Pinned Dependencies
+# Install with: pip install -r requirements.txt
+
+# Google Gemini AI SDK
+google-genai>=1.0.0
+
+# Telegram Bot Interface
+python-telegram-bot>=20.7
+
+# Web Dashboard
+streamlit>=1.35.0
+
+# Data Processing
+pandas>=2.0.0
+
+# PDF CV Text Extraction
+pypdf>=4.0.0
+
+# Image Processing (for flyer OCR)
+Pillow>=10.0.0
+
+# Environment Variable Management
+python-dotenv>=1.0.0
